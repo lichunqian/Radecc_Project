@@ -32,6 +32,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "rtc_config.h"   /* 系统时间服务（外部 DS3231，掉电不丢失） */
+#include "sd_log.h"       /* UART2 输出同步落盘：SD 卡 FATFS 文本日志 */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -50,11 +51,35 @@
 /* PA6 参考电压采集（动态阈值基准 VREF）相关 */
 #define VREF_SAMPLE_PERIOD_MS 1000UL  /* PA6 采集周期：1 秒                        */
 #define VREF_FILTER_K         8U      /* 一阶滤波系数：新样本权重 1/K，历史 (K-1)/K */
+
+/* [DBG] 汇总行（经 SDLOG_UART2 写 USART2 + SD 卡）的输出周期。
+   行内全部是那一刻的累计值快照，不做任何聚合：
+   要拿计数率就用相邻两行的 Total/Rn219/Rn220 自己相减（开机首行提供 0 基准）。
+   10 s/条：每天 8640 条 x 约 100 字节 ≈ 0.86 MB，SD 卡与 115200 串口带宽均绰绰有余
+   （单条约 100 字节 @115200 ≈ 9 ms 发送时间，远小于 10 s 周期）。
+   注意：VREF 采样与 RTC 同步仍保持 1 秒周期，不受本周期影响。 */
+#define DBG_LOG_PERIOD_MS     10000UL
 #define ADC2_PA6_CHANNEL      ADC_CHANNEL_3  /* PA6 = ADC12_IN3（ADC2 通道 3） */
 
 /* 串口 DMA 发送 FIFO：避免两次有效中断间隔过短导致发送缓冲被覆盖 */
 #define UART_TX_FIFO_SLOTS    8U
 #define UART_TX_MSG_LEN       96U     /* 四项数据帧最长约 76 字节，留足余量 */
+
+/* ---- 核素延迟符合窗（RaDeCC 法）：按“与上一有效脉冲的间隔”把第二个脉冲归类 ----
+ * 219Rn -> 215Po（t1/2 = 1.78 ms）：间隔 10 us ~ 5.6 ms（约 3tau）判为 219Rn
+ * 220Rn -> 216Po（t1/2 = 145 ms）：间隔 10 ms ~ 600 ms（约 4tau）判为 220Rn
+ * 5.6 ms ~ 10 ms 为两窗之间的死区，不归入任何一种，避免互相污染。
+ * 注意：受 ADC 采样窗口（约 21 us）限制，219 窗的实际有效下限约 21 us，
+ *       小于该值的间隔会在 EXTI 回调里被计入 D=，进不到本判据。 */
+#define RN219_MIN_US          10U        /* 219Rn 窗下限：10 us */
+#define RN219_MAX_US          5600U      /* 219Rn 窗上限：5.6 ms */
+#define RN220_MIN_US          10000U     /* 220Rn 窗下限：10 ms */
+#define RN220_MAX_US          600000U    /* 220Rn 窗上限：600 ms */
+
+/* 脉冲记录环形队列：ADC 中断里只做入队（纯内存拷贝，几十个时钟周期），
+   64 位除法格式化与 USART1 发送全部移到主循环，避免把 ~10us 的组帧时间
+   压在 ADC 中断的关键路径上（原 UART_SendRecord 直接在 ISR 内调用）。 */
+#define PULSE_Q_DEPTH         64U     /* 必须是 2 的幂，用掩码取模 */
 
 /* USER CODE END PD */
 
@@ -86,6 +111,24 @@ uint16_t adc_buf[ADC_SAMPLES];         /* ADC DMA 接收缓冲（10 个 12 位�
 uint64_t last_interval_us = 0;         /* 最近一次记录到的间隔（us）            */
 volatile uint64_t timer_overflow_us = 0; /* TIM2 1us 计数溢出累加：每 ~71.58 min +1，覆盖 24h */
 volatile uint32_t pulse_total = 0;     /* 累计脉冲总数（每次有效识别 +1） */
+volatile uint32_t edge_drop_total = 0; /* PB0 边沿因上一轮 ADC 采样未完成而被忽略的次数
+                                          （偶发近距离脉冲 <25us 会走到这里）；随记录帧 D= 上报 */
+volatile uint32_t rn219_total = 0;     /* 219Rn 计数：与上一脉冲间隔落在 10us~5.6ms 的脉冲数 */
+volatile uint32_t rn220_total = 0;     /* 220Rn 计数：与上一脉冲间隔落在 10ms~600ms 的脉冲数 */
+
+/* ---- 脉冲记录环形队列（单生产者 = ADC-DMA 中断，单消费者 = 主循环）----
+ * 目的：ISR 只保存"间隔 + 计数"两个数值，不碰字符串格式化与串口发送。
+ * 队列满时只丢记录并计数，不影响脉冲计数 pulse_total 的准确性。 */
+typedef struct
+{
+  uint64_t interval_us;   /* 与上一次有效脉冲的间隔（us）；首脉冲记为 0 */
+  uint32_t count;         /* 该次判定完成后的累计脉冲数 */
+} pulse_rec_t;
+
+static pulse_rec_t       pulse_q[PULSE_Q_DEPTH];
+static volatile uint16_t pulse_q_head = 0U;    /* 仅在 ADC 中断里推进 */
+static volatile uint16_t pulse_q_tail = 0U;    /* 仅在主循环里推进 */
+volatile uint32_t        pulse_q_drop = 0U;    /* 队列满导致记录被丢弃的次数 */
 volatile uint64_t uptime_ms_total = 0;  /* （保留）原 TIM3 溢出累加；运行时间现改由 RTC 计算，此变量不再用于 U= */
 /* 注：原 boot_sec_total（上电时刻 RTC 线性秒基准）已移入 rtc_config.c 内部
    （s_boot_ms），对外通过 RTC_GetUptimeMs() 读取，此处不再保留。 */
@@ -99,6 +142,7 @@ static volatile uint8_t uart_tx_tail = 0;  /* 消费者指针 */
 uint32_t VREF = 0U;               /* PA6 电压（mV）；用作判定阈值基准 */
 uint8_t  vref_ready = 0U;         /* 0 = 尚未完成首次采集，判定时回退到固定阈值 */
 uint32_t last_vref_tick = 0U;    /* 上次采集 PA6 的 SysTick 时间戳（ms） */
+uint32_t last_dbg_log_tick = 0U; /* 上次输出 [DBG] 汇总行的 SysTick 时间戳（ms），周期 DBG_LOG_PERIOD_MS */
 
 /* USART2 接收行缓冲（用于通过串口命令校正 RTC 时间） */
 static uint8_t  uart2_rx_byte = 0;            /* HAL_UART_Receive_IT 单字节接收缓冲 */
@@ -122,6 +166,7 @@ static void MX_I2C2_Init(void);          /* I2C2: PA8/PA9，外部 DS3231 时钟
 /* USER CODE BEGIN PFP */
 static void UART_TrySendNext(void);
 static void UART_SendRecord(uint64_t interval_us, uint32_t pulse_count);
+static void PulseQ_Push(uint64_t interval_us, uint32_t pulse_count);
 static int  fmt_clock_hms(uint32_t total_sec, uint8_t *buf);
 static int  fmt_uptime(uint32_t total_sec, uint8_t *buf);
 static uint64_t get_uptime_ms(void);    /* 读时间镜像 - 上电基准，得到运行时间(ms)，中断安全 */
@@ -241,10 +286,13 @@ static uint64_t get_uptime_ms(void)
   * @brief  组装并发送一条包含四项数据的记录
   * @param  interval_us : 相邻两次脉冲间隔（us）；首次脉冲记为 0
   * @param  pulse_count : 累计脉冲总数
- * @note   帧格式（例）：U=0d00:00:05,T=2026-10-14 22:07:53,I=123456us,N=1\r\n
+ * @note   帧格式（例）：U=0d00:00:05,T=2026-10-14 22:07:53,I=123456us,N=1,D=0,Q=0\r\n
  *         ① U= 运行时间（自启动，Dd HH:MM:SS）
  *         ② T= 当前时间（RTC 真实日历，YYYY-MM-DD HH:MM:SS）
  *         ③ I= 相邻脉冲间隔(us)  ④ N= 累计脉冲总数
+ *         ⑤ D= 因上一轮采样未完成被忽略的边沿累计数（近距离脉冲丢边沿）
+ *         ⑥ Q= 记录队列满被丢弃的条数（脉冲率超过串口带宽）
+ * @note   本函数在主循环上下文执行（由出队逻辑调用），不在中断里运行。
  */
 static void UART_SendRecord(uint64_t interval_us, uint32_t pulse_count)
 {
@@ -277,11 +325,42 @@ static void UART_SendRecord(uint64_t interval_us, uint32_t pulse_count)
   /* ④ 累计脉冲总数 */
   msg[n++] = 'N'; msg[n++] = '=';
   n += u64_to_dec((uint64_t)pulse_count, msg + n);
+  /* ⑤ 因上一轮采样未完成而被忽略的边沿累计数（诊断项：正常应为 0 或很小） */
+  msg[n++] = ',';
+  msg[n++] = 'D'; msg[n++] = '=';
+  n += u64_to_dec((uint64_t)edge_drop_total, msg + n);
+  /* ⑥ 记录队列满被丢弃的条数（诊断项：持续增长说明脉冲率超过串口带宽） */
+  msg[n++] = ',';
+  msg[n++] = 'Q'; msg[n++] = '=';
+  n += u64_to_dec((uint64_t)pulse_q_drop, msg + n);
 
   msg[n++] = '\r'; msg[n++] = '\n'; msg[n] = '\0';
 
   uart_tx_head = next;
   UART_TrySendNext();
+}
+
+/**
+  * @brief  脉冲记录入队（只在 ADC-DMA 完成回调里调用）
+  * @param  interval_us : 与上一次有效脉冲的间隔（us），首脉冲传 0
+  * @param  pulse_count : 当前累计脉冲数
+  * @note   纯内存写入，无字符串格式化、无外设操作，耗时几十个时钟周期。
+  *         队列满时丢弃本条记录并累加 pulse_q_drop——记录可丢，但
+  *         pulse_total 计数不受影响，D=/Q= 字段保证事后可核对。
+  */
+static void PulseQ_Push(uint64_t interval_us, uint32_t pulse_count)
+{
+  uint16_t next = (uint16_t)((pulse_q_head + 1U) & (PULSE_Q_DEPTH - 1U));
+
+  if (next == pulse_q_tail)          /* 队列满：主循环跟不上（串口带宽所限） */
+  {
+    pulse_q_drop++;
+    return;
+  }
+
+  pulse_q[pulse_q_head].interval_us = interval_us;
+  pulse_q[pulse_q_head].count       = pulse_count;
+  pulse_q_head = next;               /* 最后再更新 head，保证消费者看不到半成品 */
 }
 
 /* USER CODE END 0 */
@@ -327,6 +406,12 @@ int main(void)
   RTC_Config_Init();       /* 系统时基：外部 DS3231（自带电池，掉电不丢失）；
                               内部已自动抓取开机基准，无需再调用 capture_boot_time */
 
+  /* SD 卡文件系统初始化：挂载卷 + 打开/创建当日日志文件（追加模式）。
+     必须在 RTC_Config_Init 之后（文件名要取 DS3231 日期）；
+     必须在下方第一条 UART2 输出之前，让开机横幅同样落盘。
+     卡未插时返回 0，不影响运行，sd_log 内部每 5s 静默重试。 */
+  SDLOG_Init();
+
   /* USER CODE BEGIN DBG_BOOT */
   /* 上电自检横幅：复位后约 100ms 内即通过 USART2(PA2/PA3) 输出一行。
      若 PC 端串口工具能看到此行，说明 USART2 硬件/时钟/波特率均正常；
@@ -338,8 +423,8 @@ int main(void)
     static const char boot_msg[] =
       "USART2 debug ready (115200,8N1)\r\n"
       "[RTC] src=DS3231: 'set YYYY-MM-DD HH:MM:SS' to calibrate, 'time' to query\r\n";
-    HAL_UART_Transmit(&huart2, (uint8_t *)boot_msg,
-                      (uint16_t)(sizeof(boot_msg) - 1U), 200U);
+    SDLOG_UART2((uint8_t *)boot_msg,
+                (uint16_t)(sizeof(boot_msg) - 1U));
 
     /* 时钟自检结果：DS3231 是否在线、是否曾用编译时间重置（OSF）、当前时间。
        这是判断"掉电后时间是否真的不丢失"最直接的现场依据。 */
@@ -359,24 +444,36 @@ int main(void)
       {
         /* snprintf 返回"本应写入"的长度，超长时必须钳位，否则会越界发送 */
         if (rn > (int)sizeof(rtc_msg) - 1) { rn = (int)sizeof(rtc_msg) - 1; }
-        HAL_UART_Transmit(&huart2, (uint8_t *)rtc_msg, (uint16_t)rn, 200U);
+        SDLOG_UART2((uint8_t *)rtc_msg, (uint16_t)rn);
       }
       if (RTC_IsPresent() == 0U)
       {
         static const char warn[] =
           "[RTC] WARN: DS3231 not found! Check PA8/PA9, I2C pull-ups, DS3231 power/VBAT.\r\n";
-        HAL_UART_Transmit(&huart2, (uint8_t *)warn,
-                          (uint16_t)(sizeof(warn) - 1U), 200U);
+        SDLOG_UART2((uint8_t *)warn,
+                    (uint16_t)(sizeof(warn) - 1U));
       }
       else if (RTC_WasTimeReset() != 0U)
       {
         static const char warn[] =
           "[RTC] WARN: oscillator had stopped (OSF=1). Check backup battery; "
           "time reset to build time.\r\n";
-        HAL_UART_Transmit(&huart2, (uint8_t *)warn,
-                          (uint16_t)(sizeof(warn) - 1U), 200U);
+        SDLOG_UART2((uint8_t *)warn,
+                    (uint16_t)(sizeof(warn) - 1U));
       }
     }
+
+    /* 开机首条 [DBG] 快照：上电后立即落一行，作为后续所有差分的 0 基准。
+       行内 Total/Rn219/Rn220 全为 0、Seq=1，看到它即说明 USART2 + SD 卡链路已通；
+       之后每满 DBG_LOG_PERIOD_MS(10 s) 再落一行，相邻两行相减即得该时段计数率。
+       先读一次 PA6 只为让首行 VREF 显示真实电压（仅显示用途）：
+       不置 vref_ready，阈值判定仍等 1s 周期块建立基准后才切换到动态阈值。 */
+    if (vref_ready == 0U)
+    {
+      VREF = (uint32_t)((uint32_t)ADC2_ReadPA6() * VREF_MV / ADC_FULL_SCALE);
+    }
+    last_dbg_log_tick = HAL_GetTick();   /* 以开机时刻作为 10 s 周期的起点 */
+    DEBUG_Print();
   }
   /* 启动 USART2 单字节接收中断，用于接收校时命令 */
   if (HAL_UART_Receive_IT(&huart2, &uart2_rx_byte, 1) != HAL_OK)
@@ -396,8 +493,20 @@ int main(void)
   while (1)
   {
     /* USER CODE BEGIN WHILE */
-    /* 串口帧仅在“脉冲识别”时由中断回调发送（见 HAL_ADC_ConvCpltCallback），
-       主循环不主动发送，避免无脉冲时产生重复帧。此处仅处理 USART2 校时命令。 */
+    /* 串口帧只在“脉冲识别”时产生：中断回调只入队（PulseQ_Push），
+       主循环在上方出队并组帧发送，避免在 ADC 中断里做 64 位除法格式化。
+       无脉冲时队列为空，不会产生重复帧。此处仅处理 USART2 校时命令。 */
+
+    /* 脉冲记录出队：由主循环组帧并启动 USART1 TX DMA。
+       一次只发一条，靠内部 8 槽 FIFO 与队列共同吸收突发；SysTick 每 1ms
+       唤醒一次本循环，队列深度 64 足以跨过 RTC_Sync / SD 写卡的主循环停顿。 */
+    if (!uart_tx_busy && (pulse_q_tail != pulse_q_head))
+    {
+      uint64_t iv  = pulse_q[pulse_q_tail].interval_us;
+      uint32_t cnt = pulse_q[pulse_q_tail].count;
+      pulse_q_tail = (uint16_t)((pulse_q_tail + 1U) & (PULSE_Q_DEPTH - 1U));
+      UART_SendRecord(iv, cnt);
+    }
 
     /* 处理 USART2 收到的校时命令（若有完整一行） */
     if (uart2_cmd_ready)
@@ -429,9 +538,17 @@ int main(void)
         /* 一阶指数滑动平均：VREF = VREF*(K-1)/K + mv/K，K = VREF_FILTER_K */
         VREF = (VREF * (VREF_FILTER_K - 1U) + mv) / VREF_FILTER_K;
       }
+    }
 
-      /* 每秒通过 USART2(PA2/PA3) 输出一次调试信息（轮询发送，主循环上下文，无阻塞风险） */
-      DEBUG_Print();
+    /* [DBG] 汇总行：每 10 秒 1 次（周期 DBG_LOG_PERIOD_MS）。
+       经 SDLOG_UART2 同时送 USART2 与 SD 卡；行内是累计值快照，不聚合。
+       开机那一条在 DBG_BOOT 里已输出并把 last_dbg_log_tick 置为开机时刻，
+       所以这里是开机后第 1、2、3... 个 10 秒的整点，不是上电后随机相位。
+       VREF 采样与 RTC 同步仍在上面的 1 秒块里，不随本周期放慢。 */
+    if ((HAL_GetTick() - last_dbg_log_tick) >= DBG_LOG_PERIOD_MS)
+    {
+      last_dbg_log_tick = HAL_GetTick();
+      DEBUG_Print();                 /* 轮询发送，主循环上下文，无阻塞风险 */
     }
 
     __WFI();                                   /* 进入休眠，等待中断唤醒（SysTick 1ms 唤醒后再次检查 1s 周期） */
@@ -1010,42 +1127,52 @@ static uint32_t ADC2_ReadPA6(void)
 }
 
 /**
-  * @brief  通过 USART2(PA2/PA3) 输出一行调试信息（每秒一次）
-  * @note   由主循环 1s 周期块调用，运行于线程（主循环）上下文。
+  * @brief  通过 USART2(PA2/PA3) 输出一行汇总信息（每 10 秒一次）
+  * @note   调用点有两处，均运行于线程（主循环）上下文：
+  *           1) 开机 —— DBG_BOOT 区块末尾，输出 Seq=1 的 0 基准行；
+  *           2) 周期 —— 主循环按 DBG_LOG_PERIOD_MS(10 s)，输出 Seq=2,3,4...
   *         使用轮询发送 HAL_UART_Transmit（超时 10ms），不占用 DMA/中断资源。
-  *         内容包括：当前 VREF(mV)、VREF 是否已就绪、计时器是否运行、最近一次间隔。
+  *         每条就是"当时的快照"：VREF(mV)、VREF 就绪标志、计时器标志、
+  *         Total/Rn219/Rn220 累计值，外加 Seq= 第几条。
+  *         不聚合——计数率由上位机用相邻两条的 Total/Rn219/Rn220 相减得到；
+  *         总事件率 N_T = (Total 增量) + (本条 D= 的增量)。
   */
 static void DEBUG_Print(void)
 {
-  char dbg[128];
-  uint8_t intv_buf[24];
+  static char dbg[192];               /* 静态：本函数只在主循环调用、无重入，避免大缓冲压栈（栈仅 1KB）；
+                                         各计数取 10 位十进制时单条约 120 字节，192 余量充足 */
   uint8_t now_buf[20];
   int nl = fmt_rtc(now_buf);
   now_buf[nl] = '\0';                 /* 供 %s 使用 */
-  int il = u64_to_dec(last_interval_us, intv_buf);
-  intv_buf[il] = '\0';
-  /* src 字段用于现场判断时基来源：正常应恒为 DS3231；
-     若变成 SOFT，说明 DS3231 掉线，时间将不再掉电保持。 */
+  static uint32_t seq_idx = 0U;    /* 本行是开机后第几条记录，用于上位机核对有无漏行 */
+  seq_idx++;
+
   int n = snprintf(dbg, sizeof(dbg),
-                   "[DBG] %s src=%s VREF=%lu mV rdy=%u timer=%u cnt=%lu lastIntv=%s us\r\n",
+                   "%s VREF=%lu mV rdy=%u timer=%u Total=%lu Rn219=%lu Rn220=%lu"
+                   " D=%lu Q=%lu Seq=%lu\r\n",
                    (char *)now_buf,
-                   RTC_GetSourceName(),
+                   //RTC_GetSourceName(),
                    (unsigned long)VREF,
                    (unsigned int)vref_ready,
                    (unsigned int)timer_running,
                    (unsigned long)pulse_total,
-                   (char *)intv_buf);
+                   (unsigned long)rn219_total,
+                   (unsigned long)rn220_total,
+                   (unsigned long)edge_drop_total,
+                   (unsigned long)pulse_q_drop,
+                   (unsigned long)seq_idx);
   if (n < 0) n = 0;
   if ((size_t)n > sizeof(dbg) - 1U)
     n = (int)(sizeof(dbg) - 1U);
 
-  HAL_UART_Transmit(&huart2, (uint8_t *)dbg, (uint16_t)n, 10U);
+  SDLOG_UART2((uint8_t *)dbg, (uint16_t)n);
 }
 
 /**
   * @brief  TIM 周期溢出（更新）回调
-  * @note   TIM6 单触发到点：拉低 PB5 并停止 TIM6。
-  *         （TIM2 为轮询自由运行，不会进入此回调。）
+  * @note   TIM2：1 us/计数，32 位每 ~71.58 min 溢出一次，累加 timer_overflow_us 扩展量程；
+  *         TIM6：1 ms 单触发到点，拉低 PB5 并停止定时器；
+  *         TIM3：16 位保留计数器（每 ~6.55 s 溢出），仅累加 uptime_ms_total 供调试，不参与 U=。
   */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
@@ -1079,7 +1206,13 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
   if (GPIO_Pin == GPIO_PIN_0)        /* PB0 -> EXTI0 */
   {
     if (adc_busy)
-      return;                         /* 上一次 10 次采样尚未完成，忽略本次边沿 */
+    {
+      /* 上一次 10 次采样（约 20us）尚未完成，本次边沿无法启动采样。
+         不能静默丢弃：计数后由记录帧的 D= 字段上报，事后可核对丢了多少、
+         以及是否存在系统性近距离脉冲（<25us 间隔必丢第二个）。 */
+      edge_drop_total++;
+      return;
+    }
 
     adc_busy = 1;
     /* 清除上一次序列可能遗留的 EOC/OVR 标志，确保连续模式能干净重启
@@ -1143,12 +1276,16 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 
     if (!timer_running)
     {
-      /* 首次有效中断：启动定时器（清零计数器即为开始计时） */
+      /* 首次有效中断：以“清零计数器”作为计时起点 */
       __HAL_TIM_SET_COUNTER(&htim2, 0U);
-      HAL_TIM_Base_Start(&htim2);     /* 若已在 MX_TIM2_Init 预启动则无副作用 */
+      HAL_TIM_Base_Start(&htim2);     /* 已在 MX_TIM2_Init 里 Start_IT 预启动，此处只保证计数器在跑 */
+      /* 关键：清掉“上电 → 首脉冲”期间累积的溢出量。
+         TIM2 在 MX_TIM2_Init 就已 Start_IT 自由运行，若开机到首脉冲超过 71.58 min，
+         timer_overflow_us 已累加 ≥1，不清零会让第一个间隔多出 71.58 min 的整数倍。 */
+      timer_overflow_us = 0U;
       timer_running = 1;
-      /* 首次脉冲尚无间隔，记为 0，但仍输出运行时间/当前时间/计数 */
-      UART_SendRecord(0ULL, pulse_total);
+      /* 首次脉冲尚无间隔，记为 0；仍入队，由主循环补上时间戳后发出 */
+      PulseQ_Push(0ULL, pulse_total);
     }
     else
     {
@@ -1158,8 +1295,26 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
       timer_overflow_us = 0U;                              /* 重置溢出累加 */
       __HAL_TIM_SET_COUNTER(&htim2, 0U);                   /* 重启计时，准备下一个间隔 */
       last_interval_us = elapsed_us;
-      /* 通过 USART1 TX DMA 输出四项数据（运行时间/当前时间/间隔/累计计数） */
-      UART_SendRecord(elapsed_us, pulse_total);
+
+      /* ---- 按间隔归类核素（延迟符合法）----
+       * 只有“第 2 个及以后”的脉冲才有间隔可言；首脉冲在上面的 if 分支里，不参与归类。
+       * elapsed_us 已经是本次与上一次有效脉冲的微秒间隔，直接落窗判断即可。 */
+      if ((elapsed_us >= (uint64_t)RN219_MIN_US) && (elapsed_us <= (uint64_t)RN219_MAX_US))
+      {
+        rn219_total++;                       /* 10us ~ 5.6ms：判为 219Rn（215Po 符合） */
+      }
+      else if ((elapsed_us >= (uint64_t)RN220_MIN_US) && (elapsed_us <= (uint64_t)RN220_MAX_US))
+      {
+        rn220_total++;                       /* 10ms ~ 600ms：判为 220Rn（216Po 符合） */
+      }
+      else
+      {
+        /* 落在 5.6ms~10ms 死区、或 >600ms（长时间无脉冲后重新开始）、或 <10us：
+           只计入 pulse_total，不归入任何一个核素，避免污染两类计数。 */
+      }
+
+      /* 记录入队；组帧与 USART1 发送由主循环完成，中断内不再做字符串格式化 */
+      PulseQ_Push(elapsed_us, pulse_total);
     }
   }
 }
@@ -1270,7 +1425,7 @@ static void UART2_CmdProcess(void)
     {
       /* snprintf 返回"本应写入"的长度，超长时必须钳位，否则会越界发送 */
       if (n > (int)sizeof(out) - 1) { n = (int)sizeof(out) - 1; }
-      HAL_UART_Transmit(&huart2, (uint8_t *)out, (uint16_t)n, 100U);
+      SDLOG_UART2((uint8_t *)out, (uint16_t)n);
     }
     return;
   }
@@ -1281,7 +1436,7 @@ static void UART2_CmdProcess(void)
     if (RTC_ParseString(uart2_rx_line, &dt) != 0)
     {
       const char h[] = "[RTC] usage: set YYYY-MM-DD HH:MM:SS  |  time\r\n";
-      HAL_UART_Transmit(&huart2, (uint8_t *)h, (uint16_t)(sizeof(h) - 1U), 100U);
+      SDLOG_UART2((uint8_t *)h, (uint16_t)(sizeof(h) - 1U));
       return;
     }
 
@@ -1289,19 +1444,19 @@ static void UART2_CmdProcess(void)
     {
       /* 写入 DS3231 成功 -> 掉电后由纽扣电池保持 */
       const char ok[] = "[RTC] time set OK (kept by DS3231 backup battery)\r\n";
-      HAL_UART_Transmit(&huart2, (uint8_t *)ok, (uint16_t)(sizeof(ok) - 1U), 100U);
+      SDLOG_UART2((uint8_t *)ok, (uint16_t)(sizeof(ok) - 1U));
     }
     else if (RTC_IsPresent())
     {
       /* 芯片在线但写失败 -> I2C 通信异常 */
       const char er[] = "[RTC] set failed (I2C error)\r\n";
-      HAL_UART_Transmit(&huart2, (uint8_t *)er, (uint16_t)(sizeof(er) - 1U), 100U);
+      SDLOG_UART2((uint8_t *)er, (uint16_t)(sizeof(er) - 1U));
     }
     else
     {
       /* DS3231 不存在 -> 仅更新软件时钟，掉电即丢 */
       const char er[] = "[RTC] DS3231 missing: software clock only, LOST on power-down\r\n";
-      HAL_UART_Transmit(&huart2, (uint8_t *)er, (uint16_t)(sizeof(er) - 1U), 100U);
+      SDLOG_UART2((uint8_t *)er, (uint16_t)(sizeof(er) - 1U));
     }
   }
 }
