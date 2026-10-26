@@ -46,7 +46,7 @@
 #define ADC_DROP              2U      /* 去掉 1 个最大值 + 1 个最小值         */
 #define VREF_MV               3300UL  /* 参考电压 3.3V，单位 mV               */
 #define ADC_FULL_SCALE        4095UL  /* 12 位 ADC 满量程码值                 */
-#define VALID_THRESHOLD_MV    200UL   /* 判定“中断有效”的电压阈值（>500mV）  */
+#define VALID_THRESHOLD_MV    200UL   /* 固定回退阈值 200mV */
 
 /* PA6 参考电压采集（动态阈值基准 VREF）相关 */
 #define VREF_SAMPLE_PERIOD_MS 1000UL  /* PA6 采集周期：1 秒                        */
@@ -65,16 +65,14 @@
 #define UART_TX_FIFO_SLOTS    8U
 #define UART_TX_MSG_LEN       96U     /* 四项数据帧最长约 76 字节，留足余量 */
 
-/* ---- 核素延迟符合窗（RaDeCC 法）：按“与上一有效脉冲的间隔”把第二个脉冲归类 ----
- * 219Rn -> 215Po（t1/2 = 1.78 ms）：间隔 10 us ~ 5.6 ms（约 3tau）判为 219Rn
- * 220Rn -> 216Po（t1/2 = 145 ms）：间隔 10 ms ~ 600 ms（约 4tau）判为 220Rn
- * 5.6 ms ~ 10 ms 为两窗之间的死区，不归入任何一种，避免互相污染。
- * 注意：受 ADC 采样窗口（约 21 us）限制，219 窗的实际有效下限约 21 us，
- *       小于该值的间隔会在 EXTI 回调里被计入 D=，进不到本判据。 */
-#define RN219_MIN_US          10U        /* 219Rn 窗下限：10 us */
-#define RN219_MAX_US          5600U      /* 219Rn 窗上限：5.6 ms */
-#define RN220_MIN_US          10000U     /* 220Rn 窗下限：10 ms */
-#define RN220_MAX_US          600000U    /* 220Rn 窗上限：600 ms */
+/* ---- Software delayed coincidence windows, modeled after Figure 2 ----
+ * 219: 150 us delay + 5600 us gate; 220: 10 ms delay + 600 ms gate.
+ * These constants describe the gates, not a nearest-neighbor classifier.
+ * Validation with known sources is required for quantitative Ra activities. */
+#define RN219_MIN_US          150U
+#define RN219_MAX_US          5750U
+#define RN220_MIN_US          10000U
+#define RN220_MAX_US          610000U
 
 /* 脉冲记录环形队列：ADC 中断里只做入队（纯内存拷贝，几十个时钟周期），
    64 位除法格式化与 USART1 发送全部移到主循环，避免把 ~10us 的组帧时间
@@ -113,8 +111,26 @@ volatile uint64_t timer_overflow_us = 0; /* TIM2 1us 计数溢出累加：每 ~7
 volatile uint32_t pulse_total = 0;     /* 累计脉冲总数（每次有效识别 +1） */
 volatile uint32_t edge_drop_total = 0; /* PB0 边沿因上一轮 ADC 采样未完成而被忽略的次数
                                           （偶发近距离脉冲 <25us 会走到这里）；随记录帧 D= 上报 */
-volatile uint32_t rn219_total = 0;     /* 219Rn 计数：与上一脉冲间隔落在 10us~5.6ms 的脉冲数 */
-volatile uint32_t rn220_total = 0;     /* 220Rn 计数：与上一脉冲间隔落在 10ms~600ms 的脉冲数 */
+volatile uint32_t rn219_total = 0;     /* 219 窗口原始候选符合计数，尚未扣除随机符合/串扰 */
+volatile uint32_t rn220_total = 0;     /* 220 窗口原始候选符合计数，尚未扣除随机符合/串扰 */
+/* Software delayed-coincidence prototype: 2 independent non-retriggering gates.
+ * A gate accepts at most one following pulse; it remains occupied until its
+ * original deadline. This is a design choice, not proven equivalent to the
+ * Moore & Arnold discriminator hardware. Validate with pulser/standards. */
+typedef struct {
+  uint64_t trigger_us;
+  uint32_t delay_us;
+  uint32_t width_us;
+  uint8_t active;
+  uint8_t counted;
+} radecc_gate_t;
+static radecc_gate_t gate219 = {0U, RN219_MIN_US, RN219_MAX_US - RN219_MIN_US, 0U, 0U};
+static radecc_gate_t gate220 = {0U, RN220_MIN_US, RN220_MAX_US - RN220_MIN_US, 0U, 0U};
+static volatile uint64_t pending_edge_us = 0U;
+static uint64_t last_valid_edge_us = 0U;
+static uint8_t have_last_valid_edge = 0U;
+
+/* Raw capture time is saved separately from the legacy serial interval field. */
 
 /* ---- 脉冲记录环形队列（单生产者 = ADC-DMA 中断，单消费者 = 主循环）----
  * 目的：ISR 只保存"间隔 + 计数"两个数值，不碰字符串格式化与串口发送。
@@ -123,6 +139,9 @@ typedef struct
 {
   uint64_t interval_us;   /* 与上一次有效脉冲的间隔（us）；首脉冲记为 0 */
   uint32_t count;         /* 该次判定完成后的累计脉冲数 */
+  uint64_t timestamp_us;  /* 原始有效脉冲的自由运行时间戳 */
+  uint32_t count219;      /* 此刻219窗口累计计数快照 */
+  uint32_t count220;      /* 此刻220窗口累计计数快照 */
 } pulse_rec_t;
 
 static pulse_rec_t       pulse_q[PULSE_Q_DEPTH];
@@ -166,7 +185,9 @@ static void MX_I2C2_Init(void);          /* I2C2: PA8/PA9，外部 DS3231 时钟
 /* USER CODE BEGIN PFP */
 static void UART_TrySendNext(void);
 static void UART_SendRecord(uint64_t interval_us, uint32_t pulse_count);
-static void PulseQ_Push(uint64_t interval_us, uint32_t pulse_count);
+static void PulseQ_Push(uint64_t interval_us, uint32_t pulse_count, uint64_t timestamp_us);
+static uint64_t TIM2_GetTimestampUs(void);
+static void RaDeCC_ProcessGate(radecc_gate_t *gate, uint64_t now_us, volatile uint32_t *counter);
 static int  fmt_clock_hms(uint32_t total_sec, uint8_t *buf);
 static int  fmt_uptime(uint32_t total_sec, uint8_t *buf);
 static uint64_t get_uptime_ms(void);    /* 读时间镜像 - 上电基准，得到运行时间(ms)，中断安全 */
@@ -348,7 +369,7 @@ static void UART_SendRecord(uint64_t interval_us, uint32_t pulse_count)
   *         队列满时丢弃本条记录并累加 pulse_q_drop——记录可丢，但
   *         pulse_total 计数不受影响，D=/Q= 字段保证事后可核对。
   */
-static void PulseQ_Push(uint64_t interval_us, uint32_t pulse_count)
+static void PulseQ_Push(uint64_t interval_us, uint32_t pulse_count, uint64_t timestamp_us)
 {
   uint16_t next = (uint16_t)((pulse_q_head + 1U) & (PULSE_Q_DEPTH - 1U));
 
@@ -360,7 +381,54 @@ static void PulseQ_Push(uint64_t interval_us, uint32_t pulse_count)
 
   pulse_q[pulse_q_head].interval_us = interval_us;
   pulse_q[pulse_q_head].count       = pulse_count;
+  pulse_q[pulse_q_head].timestamp_us = timestamp_us;
+  pulse_q[pulse_q_head].count219 = rn219_total;
+  pulse_q[pulse_q_head].count220 = rn220_total;
   pulse_q_head = next;               /* 最后再更新 head，保证消费者看不到半成品 */
+}
+
+/* Capture a monotonic 64-bit 1-us timestamp from free-running TIM2.
+ * Avoid a pending TIM2 update ISR causing an off-by-one-wrap value.
+ * Short IRQ masking keeps epoch + counter + UIF observation coherent.
+ * TIM2 must never be cleared after startup. */
+static uint64_t TIM2_GetTimestampUs(void)
+{
+  uint32_t mask = __get_PRIMASK();
+  __disable_irq();
+  uint64_t epoch = timer_overflow_us;
+  uint32_t count = TIM2->CNT;
+  if ((__HAL_TIM_GET_FLAG(&htim2, TIM_FLAG_UPDATE) != RESET) &&
+      count < 0x80000000UL)
+  {
+    epoch += 0x100000000ULL;
+  }
+  __set_PRIMASK(mask);
+  return epoch + (uint64_t)count;
+}
+
+/* One trigger per gate until the gate expires; at most one coincidence.
+ * Trigger photons during DELAY do not reset the gate. On expiry, the current
+ * pulse is allowed to serve as the trigger of the next gate. */
+static void RaDeCC_ProcessGate(radecc_gate_t *gate, uint64_t now_us,
+                               volatile uint32_t *counter)
+{
+  if (gate->active)
+  {
+    uint64_t delta = now_us - gate->trigger_us;
+    uint64_t end = (uint64_t)gate->delay_us + gate->width_us;
+    if (delta < end)
+    {
+      if (delta >= gate->delay_us && !gate->counted)
+      {
+        (*counter)++;
+        gate->counted = 1U;
+      }
+      return;
+    }
+  }
+  gate->trigger_us = now_us;
+  gate->active = 1U;
+  gate->counted = 0U;
 }
 
 /* USER CODE END 0 */
@@ -742,7 +810,7 @@ static void MX_TIM2_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN TIM2_Init 1 */
-  /* 预启动定时器（自由运行 + 溢出中断），首次有效中断时清零 CNT 即等效“启动计时” */
+  /* TIM2 permanently free-runs; do NOT reset CNT for each pulse. */
   HAL_NVIC_SetPriority(TIM2_IRQn, 5, 0);   /* 低于 ADC-DMA(1)/TIM6(4)/USART1(4)，不抢占采样处理 */
   HAL_NVIC_EnableIRQ(TIM2_IRQn);
   if (HAL_TIM_Base_Start_IT(&htim2) != HAL_OK)
@@ -1205,6 +1273,8 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   if (GPIO_Pin == GPIO_PIN_0)        /* PB0 -> EXTI0 */
   {
+    /* Capture edge time before ADC sampling/validation introduces latency. */
+    uint64_t edge_us = TIM2_GetTimestampUs();
     if (adc_busy)
     {
       /* 上一次 10 次采样（约 20us）尚未完成，本次边沿无法启动采样。
@@ -1214,6 +1284,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
       return;
     }
 
+    pending_edge_us = edge_us;
     adc_busy = 1;
     /* 清除上一次序列可能遗留的 EOC/OVR 标志，确保连续模式能干净重启
        （连续转换下，DMA 传完 10 个后 ADC 可能多转 1~2 次并置 OVR） */
@@ -1230,9 +1301,9 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
   * @brief  ADC DMA 传输完成回调
   * @param  hadc : ADC 句柄
   * @note   在此完成：停止 ADC+DMA -> 去最大值/最小值 -> 剩余 8 次平均 ->
-  *         换算电压 -> 与 500mV 比较判定“中断有效”。
-  *         有效且为首次：清零并（已）启动定时器；
-  *         有效且非首次：读取定时器计数值（间隔 ms），清零重启，并通过 USART1 DMA 输出。
+  *         换算电压 -> 与动态 REF / 回退阈值比较判定“中断有效”。
+  *         ADC 验证成功后提交 EXTI 捕获的原始时间戳，TIM2 始终自由运行。
+  *         219/220 由独立软件门统计，USART1 继续输出相邻间隔。
   *         此函数运行于 DMA1_Channel1 中断上下文。
   */
 uint32_t voltage_mv=0;
@@ -1242,9 +1313,9 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
   if (hadc->Instance != ADC1)
     return;
 
-  /* 1) 停止 ADC 与 DMA（连续模式下自动停止，实现“10 次后自动停止”） */
+  /* 1) 先复制时间戳，整个回调完成前保持 adc_busy=1，防止 EXTI 覆盖 pending_edge_us/adc_buf */
+  uint64_t now_us = pending_edge_us;
   HAL_ADC_Stop_DMA(&hadc1);
-  adc_busy = 0;
 
   /* 2) 去最大值、最小值，求剩余 8 次平均 */
   uint16_t maxv = 0U, minv = 0xFFFFU;
@@ -1262,61 +1333,41 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
   /* 3) 换算为电压（mV）：代码值 -> 电压 */
   voltage_mv = (uint32_t)avg * VREF_MV / ADC_FULL_SCALE;
 
-  /* 4) 判定“中断有效”：动态阈值 (VREF + 50) mV；VREF 尚未就绪时回退原固定阈值 */
+  /* 4) 判定“中断有效”：动态阈值 VREF；VREF 尚未就绪时回退固定阈值 */
 //  valid_thr_mv = vref_ready ? (VREF + 50U) : VALID_THRESHOLD_MV;  /* 动态阈值 = VREF + 50 mV（需求） */
    valid_thr_mv = vref_ready ? (VREF ) : VALID_THRESHOLD_MV;  /* 动态阈值 = VREF（需求） */
-  /* 动态阈值按需求用“>=（VREF+50）”；未就绪回退时沿用原“>固定阈值”语义 */
+  /* 动态阈值使用 >=VREF；未就绪时保持 >200mV 回退阈值 */
   if (vref_ready ? (voltage_mv >= valid_thr_mv) : (voltage_mv > valid_thr_mv))
   {
     /* 脉冲识别：PB5 输出 1ms 脉冲（硬件 TIM6 单触发，ISR 内不阻塞） */
     Pulse_TriggerPB5();
     HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);    /* PC13 每次识别到脉冲翻转一次 */
 
-    pulse_total++;                              /* ④ 累计脉冲总数 +1（每次有效识别） */
+    /* Commit only ADC-validated edges; Total remains a count of accepted pulses. */
+    pulse_total++;
 
-    if (!timer_running)
+    uint64_t elapsed_us = 0ULL;
+    if (have_last_valid_edge)
     {
-      /* 首次有效中断：以“清零计数器”作为计时起点 */
-      __HAL_TIM_SET_COUNTER(&htim2, 0U);
-      HAL_TIM_Base_Start(&htim2);     /* 已在 MX_TIM2_Init 里 Start_IT 预启动，此处只保证计数器在跑 */
-      /* 关键：清掉“上电 → 首脉冲”期间累积的溢出量。
-         TIM2 在 MX_TIM2_Init 就已 Start_IT 自由运行，若开机到首脉冲超过 71.58 min，
-         timer_overflow_us 已累加 ≥1，不清零会让第一个间隔多出 71.58 min 的整数倍。 */
-      timer_overflow_us = 0U;
-      timer_running = 1;
-      /* 首次脉冲尚无间隔，记为 0；仍入队，由主循环补上时间戳后发出 */
-      PulseQ_Push(0ULL, pulse_total);
+      elapsed_us = now_us - last_valid_edge_us;
     }
     else
     {
-      /* 后续有效中断：读取两次有效中断之间的间隔（us），清零重启，发送 */
-      /* 节拍为 1 MHz（1 us/计数）；叠加溢出累加值以覆盖 > 71.58 分钟的长间隔 */
-      uint64_t elapsed_us = timer_overflow_us + (uint64_t)__HAL_TIM_GET_COUNTER(&htim2);
-      timer_overflow_us = 0U;                              /* 重置溢出累加 */
-      __HAL_TIM_SET_COUNTER(&htim2, 0U);                   /* 重启计时，准备下一个间隔 */
-      last_interval_us = elapsed_us;
-
-      /* ---- 按间隔归类核素（延迟符合法）----
-       * 只有“第 2 个及以后”的脉冲才有间隔可言；首脉冲在上面的 if 分支里，不参与归类。
-       * elapsed_us 已经是本次与上一次有效脉冲的微秒间隔，直接落窗判断即可。 */
-      if ((elapsed_us >= (uint64_t)RN219_MIN_US) && (elapsed_us <= (uint64_t)RN219_MAX_US))
-      {
-        rn219_total++;                       /* 10us ~ 5.6ms：判为 219Rn（215Po 符合） */
-      }
-      else if ((elapsed_us >= (uint64_t)RN220_MIN_US) && (elapsed_us <= (uint64_t)RN220_MAX_US))
-      {
-        rn220_total++;                       /* 10ms ~ 600ms：判为 220Rn（216Po 符合） */
-      }
-      else
-      {
-        /* 落在 5.6ms~10ms 死区、或 >600ms（长时间无脉冲后重新开始）、或 <10us：
-           只计入 pulse_total，不归入任何一个核素，避免污染两类计数。 */
-      }
-
-      /* 记录入队；组帧与 USART1 发送由主循环完成，中断内不再做字符串格式化 */
-      PulseQ_Push(elapsed_us, pulse_total);
+      have_last_valid_edge = 1U;
+      timer_running = 1U; /* retained for compatibility with existing diagnostics */
     }
+    last_valid_edge_us = now_us;
+    last_interval_us = elapsed_us;
+
+    /* Independent, non-retriggering coincidence windows. */
+    RaDeCC_ProcessGate(&gate219, now_us, &rn219_total);
+    RaDeCC_ProcessGate(&gate220, now_us, &rn220_total);
+
+    /* Preserve existing USART1 interval/count record format. */
+    PulseQ_Push(elapsed_us, pulse_total, now_us);
   }
+  /* 完成采样处理、窗口统计和入队后，才允许下一个 EXTI 启动 ADC。 */
+  adc_busy = 0;
 }
 
 /**

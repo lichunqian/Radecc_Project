@@ -1,0 +1,52 @@
+objects\sd_log.o: ..\Core\Src\sd_log.c
+objects\sd_log.o: ../Core/Inc/sd_log.h
+objects\sd_log.o: D:\Program Files\Keil_v5\ARM\ARMCC\Bin\..\include\stdint.h
+objects\sd_log.o: ../Core/Inc/main.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal.h
+objects\sd_log.o: ../Core/Inc/stm32g4xx_hal_conf.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_rcc.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_def.h
+objects\sd_log.o: ../Drivers/CMSIS/Device/ST/STM32G4xx/Include/stm32g4xx.h
+objects\sd_log.o: ../Drivers/CMSIS/Device/ST/STM32G4xx/Include/stm32g431xx.h
+objects\sd_log.o: ../Drivers/CMSIS/Include/core_cm4.h
+objects\sd_log.o: ../Drivers/CMSIS/Include/cmsis_version.h
+objects\sd_log.o: ../Drivers/CMSIS/Include/cmsis_compiler.h
+objects\sd_log.o: ../Drivers/CMSIS/Include/cmsis_armcc.h
+objects\sd_log.o: ../Drivers/CMSIS/Include/mpu_armv7.h
+objects\sd_log.o: ../Drivers/CMSIS/Device/ST/STM32G4xx/Include/system_stm32g4xx.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/Legacy/stm32_hal_legacy.h
+objects\sd_log.o: D:\Program Files\Keil_v5\ARM\ARMCC\Bin\..\include\stddef.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_rcc_ex.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_gpio.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_gpio_ex.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_dma.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_dma_ex.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_cortex.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_adc.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_ll_adc.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_adc_ex.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_dac.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_dac_ex.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_exti.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_flash.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_flash_ex.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_flash_ramfunc.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_i2c.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_i2c_ex.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_pwr.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_pwr_ex.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_spi.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_spi_ex.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_tim.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_tim_ex.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_uart.h
+objects\sd_log.o: ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_uart_ex.h
+objects\sd_log.o: D:\Program Files\Keil_v5\ARM\ARMCC\Bin\..\include\string.h
+objects\sd_log.o: D:\Program Files\Keil_v5\ARM\ARMCC\Bin\..\include\stdio.h
+objects\sd_log.o: ..\Middlewares\Third_Party\FatFs\src\ff.h
+objects\sd_log.o: ..\Middlewares\Third_Party\FatFs\src\integer.h
+objects\sd_log.o: ..\Middlewares\Third_Party\FatFs\src\ffconf.h
+objects\sd_log.o: ..\Middlewares\Third_Party\FatFs\src\diskio.h
+objects\sd_log.o: ../Core/Inc/bsp_sd_spi.h
+objects\sd_log.o: ../Core/Inc/rtc_config.h

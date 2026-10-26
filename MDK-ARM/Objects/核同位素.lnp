@@ -5,6 +5,8 @@
 "objects\stm32g4xx_hal_msp.o"
 "objects\ds3231.o"
 "objects\rtc_config.o"
+"objects\sd_log.o"
+"objects\bsp_sd_spi.o"
 "objects\stm32g4xx_hal_adc.o"
 "objects\stm32g4xx_hal_adc_ex.o"
 "objects\stm32g4xx_ll_adc.o"
@@ -29,7 +31,12 @@
 "objects\stm32g4xx_hal_uart_ex.o"
 "objects\stm32g4xx_hal_i2c.o"
 "objects\stm32g4xx_hal_i2c_ex.o"
-"objects\system_stm32g4xx.o"
+"objects\stm32g4xx_hal_spi.o"
+"objects\stm32g4xx_hal_spi_ex.o"
+"objects\system_stm32g4xx_1.o"
+"objects\diskio.o"
+"objects\ff.o"
+"objects\ff_unicode.o"
 --strict --scatter "Objects\ºËÍ¬Î»ËØ.sct"
 --summary_stderr --info summarysizes --map --load_addr_map_info --xref --callgraph --symbols
 --info sizes --info totals --info unused --info veneers
